@@ -1,0 +1,15 @@
+# Never commit sample content or third-party binaries
+*.mse
+*.wav
+*.WAV
+*.aif
+*.aiff
+*.exe
+*_wav/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
