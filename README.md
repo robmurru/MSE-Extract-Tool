@@ -64,15 +64,15 @@ Each sample embedded in a `.mse` file is stored as:
 uint32  bytes per sample
 uint32  sample rate
 uint32  channels
-uint32  unknown (0 or a library-specific value, doesn't affect the layout)
+uint32  unknown (0 or a library-specific value such as 28672, not a format flag)
 uint64  frame count
-<interleaved little-endian PCM: frames * channels * bytes>
+<interleaved little-endian PCM: frames * channels * bytes; 4-byte samples can be integer or float>
 <zone data: root note, loop mode, start/end, loop start/end, ...>
 ```
 
 The audio is stored uncompressed and is not encrypted. Sample rates are not limited to the standard ones (e.g. 31244 Hz for K2000-era samples).
 
-The tool was tested on 16-bit mono and stereo files at many sample rates (17-96 kHz). Other bit depths are handled but untested. If a file doesn't extract correctly, please open an issue. Describe the file, but don't attach copyrighted material.
+The tool was tested on 16-bit mono and stereo files at many sample rates (17-96 kHz) and on 32-bit float mono files. Other bit depths are handled but untested. If a file doesn't extract correctly, please open an issue. Describe the file, but don't attach copyrighted material.
 
 ## Disclaimer
 

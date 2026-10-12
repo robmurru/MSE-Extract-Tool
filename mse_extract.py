@@ -1,27 +1,7 @@
 #!/usr/bin/env python3
-"""
-MSE Extract Tool - extracts the WAV samples stored inside .mse instrument files.
-(c) 2026 muR Lab - MIT License - work in progress
-
-Layout of each sample embedded in a .mse file:
-    <original path>.wav\0   (or .flac etc.: the source is always stored decoded)
-    uint32 bytes per sample
-    uint32 sample rate
-    uint32 channels
-    uint32 unknown (0, or a library-specific value; doesn't affect the layout)
-    uint64 frame count
-    <interleaved little-endian PCM: frames * channels * bytes>
-    zone: uint32 root, uint32 ?, uint32 ?, uint32 ?, uint32 ?, uint32 loop mode,
-          uint64 start, uint64 end, uint64 loop start, uint64 loop end
-The same path can appear more than once: only the first occurrence holds the
-audio, later ones are references (detected and skipped).
-
-Usage:
-    python3 mse_extract.py                      # interactive menu
-    python3 mse_extract.py <file.mse or folder> [...] [-o output_folder]
-"""
 import argparse
 import hashlib
+import math
 import mmap
 import re
 import shlex
@@ -29,14 +9,13 @@ import struct
 import sys
 from pathlib import Path
 
-EXT_RE = re.compile(rb"\.[A-Za-z0-9]{2,5}\x00")  # any extension: the header check filters
+EXT_RE = re.compile(rb"\.[A-Za-z0-9]{2,5}\x00")
 HDR = struct.Struct("<IIIIQ")
 ZONE = struct.Struct("<6I4Q")
-MIN_RATE, MAX_RATE = 4000, 384000  # not just standard rates: K2000-era samples use e.g. 31244 Hz
+MIN_RATE, MAX_RATE = 4000, 384000
 
 
 def find_samples(d):
-    """Returns (name, channels, rate, bytes, frames, pcm_offset, loop) for each sample."""
     out = []
     pos = 0
     while True:
@@ -49,7 +28,7 @@ def find_samples(d):
             continue
         bps, sr, ch, _, frames = HDR.unpack_from(d, e)
         if not (1 <= ch <= 8 and MIN_RATE <= sr <= MAX_RATE and bps in (1, 2, 3, 4) and frames > 0):
-            continue  # reference to a sample already stored, not audio
+            continue
         start = e + HDR.size
         end = start + frames * ch * bps
         if end > len(d):
@@ -58,12 +37,11 @@ def find_samples(d):
         raw_name = d[max(lo, d.rfind(b"\x00", lo, m.start()) + 1):m.end() - 1]
         name = re.split(rb"[\\/]", raw_name)[-1].decode("utf-8", "replace")
         out.append((name, ch, sr, bps, frames, start, read_loop(d, end, frames)))
-        pos = end  # skip the PCM
+        pos = end
     return out
 
 
 def read_loop(d, off, frames):
-    """Reads root note and loop points from the zone following the PCM, if plausible."""
     if off + ZONE.size > len(d):
         return None
     root, _, _, _, _, mode, _, _, ls, le = ZONE.unpack_from(d, off)
@@ -72,9 +50,21 @@ def read_loop(d, off, frames):
     return root, ls, le
 
 
-def wav_bytes(pcm, ch, sr, bps, loop):
-    fmt_chunk = struct.pack("<HHIIHH", 1, ch, sr, sr * ch * bps, ch * bps, bps * 8)
+def is_float(pcm, bps):
+    if bps != 4 or len(pcm) % 4:
+        return False
+    values = memoryview(pcm).cast("f")
+    step = max(1, len(values) // 65536)
+    return all(math.isfinite(x) and abs(x) <= 16 for x in values[::step])
+
+
+def wav_bytes(pcm, ch, sr, bps, loop, float_data=False):
+    fmt_chunk = struct.pack("<HHIIHH", 3 if float_data else 1, ch, sr, sr * ch * bps, ch * bps, bps * 8)
+    if float_data:
+        fmt_chunk += struct.pack("<H", 0)
     chunks = [b"fmt " + struct.pack("<I", len(fmt_chunk)) + fmt_chunk]
+    if float_data:
+        chunks.append(b"fact" + struct.pack("<II", 4, len(pcm) // (ch * bps)))
     data = bytes(pcm)
     chunks.append(b"data" + struct.pack("<I", len(data)) + data + (b"\x00" if len(data) % 2 else b""))
     if loop:
@@ -92,9 +82,6 @@ def safe_name(s):
 
 
 def extract(mse_path, out_dir, claimed, write_loops=True, overwrite=False):
-    """Writes the samples of one .mse into out_dir. `claimed` maps (folder, lowercase name) to the
-    digest of the audio written there during this run, so that samples shared by several .mse files
-    in the same folder are written once, and different samples with the same name get a suffix."""
     with open(mse_path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d:
         if d[:4] != b"MSE ":
             print(f"  ! {mse_path.name}: not an MSE file, skipped")
@@ -107,8 +94,8 @@ def extract(mse_path, out_dir, claimed, write_loops=True, overwrite=False):
         written = skipped = shared = 0
         for name, ch, sr, bps, frames, start, loop in samples:
             pcm = d[start:start + frames * ch * bps]
-            data = wav_bytes(pcm, ch, sr, bps, loop if write_loops else None)
-            # same audio with different loop points (e.g. one sample used by several kits) is one sample
+            float_data = is_float(pcm, bps)
+            data = wav_bytes(pcm, ch, sr, bps, loop if write_loops else None, float_data)
             digest = hashlib.sha1(struct.pack("<3I", ch, sr, bps) + pcm).digest()
             stem = Path(safe_name(name)).stem
             fname, i = stem + ".wav", 2
@@ -135,7 +122,7 @@ def extract(mse_path, out_dir, claimed, write_loops=True, overwrite=False):
                 skipped += 1
             else:
                 dest.write_bytes(data)
-                info = f"{ch}ch {sr}Hz {bps * 8}bit {frames / sr:.2f}s"
+                info = f"{ch}ch {sr}Hz {bps * 8}bit{' float' if float_data else ''} {frames / sr:.2f}s"
                 if loop and write_loops:
                     info += f" loop {loop[1]}-{loop[2]}"
                 print(f"    + {fname}  ({info})")
@@ -144,7 +131,6 @@ def extract(mse_path, out_dir, claimed, write_loops=True, overwrite=False):
 
 
 def collect(inp):
-    """Returns (list of .mse files, base folder) for a file or folder."""
     if inp.is_dir():
         return sorted(p for p in inp.rglob("*") if p.suffix.lower() == ".mse" and p.is_file()), inp
     if inp.is_file():
@@ -153,7 +139,6 @@ def collect(inp):
 
 
 def folder_name(name):
-    """'Sample Bank.instruments' -> 'Sample Bank'."""
     return name[:-len(".instruments")] if name.lower().endswith(".instruments") else name
 
 
@@ -190,8 +175,6 @@ def run(inputs, output=None, per_mse=False, write_loops=True, overwrite=False):
           f"{total_shared} shared between .mse files, from {total_files} .mse files")
 
 
-# ---------------------------------------------------------------- interactive menu
-
 def ask(prompt):
     try:
         return input(prompt).strip()
@@ -200,7 +183,6 @@ def ask(prompt):
 
 
 def parse_paths(text):
-    """Accepts typed, quoted or drag-and-dropped paths (one or more)."""
     if not text:
         return []
     if Path(text).expanduser().exists():
