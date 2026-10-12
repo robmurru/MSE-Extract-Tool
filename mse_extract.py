@@ -4,11 +4,11 @@ MSE Extract Tool - extracts the WAV samples stored inside .mse instrument files.
 (c) 2026 muR Lab - MIT License - work in progress
 
 Layout of each sample embedded in a .mse file:
-    <original path>.wav\0
-    uint32 channels
-    uint32 sample rate
+    <original path>.wav\0   (or .flac etc.: the source is always stored decoded)
     uint32 bytes per sample
-    uint32 format flag (0 = integer PCM)
+    uint32 sample rate
+    uint32 channels
+    uint32 unknown (0, or a library-specific value; doesn't affect the layout)
     uint64 frame count
     <interleaved little-endian PCM: frames * channels * bytes>
     zone: uint32 root, uint32 ?, uint32 ?, uint32 ?, uint32 ?, uint32 loop mode,
@@ -21,6 +21,7 @@ Usage:
     python3 mse_extract.py <file.mse or folder> [...] [-o output_folder]
 """
 import argparse
+import hashlib
 import mmap
 import re
 import shlex
@@ -28,14 +29,14 @@ import struct
 import sys
 from pathlib import Path
 
-EXT_RE = re.compile(rb"\.(?:wav|aif|aiff)\x00", re.IGNORECASE)
+EXT_RE = re.compile(rb"\.[A-Za-z0-9]{2,5}\x00")  # any extension: the header check filters
 HDR = struct.Struct("<IIIIQ")
 ZONE = struct.Struct("<6I4Q")
-VALID_RATES = {8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000}
+MIN_RATE, MAX_RATE = 4000, 384000  # not just standard rates: K2000-era samples use e.g. 31244 Hz
 
 
 def find_samples(d):
-    """Returns (name, channels, rate, bytes, flag, frames, pcm_offset, loop) for each sample."""
+    """Returns (name, channels, rate, bytes, frames, pcm_offset, loop) for each sample."""
     out = []
     pos = 0
     while True:
@@ -46,8 +47,8 @@ def find_samples(d):
         pos = m.end()
         if e + HDR.size > len(d):
             continue
-        ch, sr, bps, fmt, frames = HDR.unpack_from(d, e)
-        if not (1 <= ch <= 8 and sr in VALID_RATES and bps in (1, 2, 3, 4) and frames > 0):
+        bps, sr, ch, _, frames = HDR.unpack_from(d, e)
+        if not (1 <= ch <= 8 and MIN_RATE <= sr <= MAX_RATE and bps in (1, 2, 3, 4) and frames > 0):
             continue  # reference to a sample already stored, not audio
         start = e + HDR.size
         end = start + frames * ch * bps
@@ -56,7 +57,7 @@ def find_samples(d):
         lo = max(0, m.start() - 1024)
         raw_name = d[max(lo, d.rfind(b"\x00", lo, m.start()) + 1):m.end() - 1]
         name = re.split(rb"[\\/]", raw_name)[-1].decode("utf-8", "replace")
-        out.append((name, ch, sr, bps, fmt, frames, start, read_loop(d, end, frames)))
+        out.append((name, ch, sr, bps, frames, start, read_loop(d, end, frames)))
         pos = end  # skip the PCM
     return out
 
@@ -71,9 +72,8 @@ def read_loop(d, off, frames):
     return root, ls, le
 
 
-def wav_bytes(pcm, ch, sr, bps, fmt, loop):
-    fmt_tag = 3 if (fmt == 1 and bps == 4) else 1
-    fmt_chunk = struct.pack("<HHIIHH", fmt_tag, ch, sr, sr * ch * bps, ch * bps, bps * 8)
+def wav_bytes(pcm, ch, sr, bps, loop):
+    fmt_chunk = struct.pack("<HHIIHH", 1, ch, sr, sr * ch * bps, ch * bps, bps * 8)
     chunks = [b"fmt " + struct.pack("<I", len(fmt_chunk)) + fmt_chunk]
     data = bytes(pcm)
     chunks.append(b"data" + struct.pack("<I", len(data)) + data + (b"\x00" if len(data) % 2 else b""))
@@ -91,39 +91,56 @@ def safe_name(s):
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", s).strip() or "sample"
 
 
-def extract(mse_path, out_dir, write_loops=True, overwrite=False):
+def extract(mse_path, out_dir, claimed, write_loops=True, overwrite=False):
+    """Writes the samples of one .mse into out_dir. `claimed` maps (folder, lowercase name) to the
+    digest of the audio written there during this run, so that samples shared by several .mse files
+    in the same folder are written once, and different samples with the same name get a suffix."""
     with open(mse_path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d:
         if d[:4] != b"MSE ":
             print(f"  ! {mse_path.name}: not an MSE file, skipped")
-            return 0, 0
+            return 0, 0, 0
         samples = find_samples(d)
         if not samples:
             print(f"  ! {mse_path.name}: no samples found")
-            return 0, 0
+            return 0, 0, 0
         out_dir.mkdir(parents=True, exist_ok=True)
-        used = set()
-        written = skipped = 0
-        for name, ch, sr, bps, fmt, frames, start, loop in samples:
+        written = skipped = shared = 0
+        for name, ch, sr, bps, frames, start, loop in samples:
+            pcm = d[start:start + frames * ch * bps]
+            data = wav_bytes(pcm, ch, sr, bps, loop if write_loops else None)
+            # same audio with different loop points (e.g. one sample used by several kits) is one sample
+            digest = hashlib.sha1(struct.pack("<3I", ch, sr, bps) + pcm).digest()
             stem = Path(safe_name(name)).stem
             fname, i = stem + ".wav", 2
-            while fname.lower() in used:
+            while True:
+                key = (out_dir, fname.lower())
+                dest = out_dir / fname
+                if key in claimed:
+                    if claimed[key] == digest:
+                        status = "shared"
+                        break
+                elif not dest.exists() or overwrite:
+                    status = "write"
+                    break
+                elif dest.stat().st_size == len(data) and dest.read_bytes() == data:
+                    status = "exists"
+                    break
                 fname, i = f"{stem} ({i}).wav", i + 1
-            used.add(fname.lower())
-            dest = out_dir / fname
-            if dest.exists() and not overwrite:
-                print(f"    = {dest.name} already exists, skipped")
+            claimed[key] = digest
+            if status == "shared":
+                print(f"    ~ {fname} already extracted from another .mse, skipped")
+                shared += 1
+            elif status == "exists":
+                print(f"    = {fname} already exists, skipped")
                 skipped += 1
-                continue
-            if fmt != 0:
-                print(f"    ? {fname}: unknown format flag {fmt}, written as PCM")
-            pcm = d[start:start + frames * ch * bps]
-            dest.write_bytes(wav_bytes(pcm, ch, sr, bps, fmt, loop if write_loops else None))
-            info = f"{ch}ch {sr}Hz {bps * 8}bit {frames / sr:.2f}s"
-            if loop and write_loops:
-                info += f" loop {loop[1]}-{loop[2]}"
-            print(f"    + {fname}  ({info})")
-            written += 1
-        return written, skipped
+            else:
+                dest.write_bytes(data)
+                info = f"{ch}ch {sr}Hz {bps * 8}bit {frames / sr:.2f}s"
+                if loop and write_loops:
+                    info += f" loop {loop[1]}-{loop[2]}"
+                print(f"    + {fname}  ({info})")
+                written += 1
+        return written, skipped, shared
 
 
 def collect(inp):
@@ -135,12 +152,18 @@ def collect(inp):
     return [], None
 
 
+def folder_name(name):
+    """'Pastoral Tones.instruments' -> 'Pastoral Tones'."""
+    return name[:-len(".instruments")] if name.lower().endswith(".instruments") else name
+
+
 def default_output(base):
-    return base.parent / (base.name + "_wav")
+    return base.parent / (folder_name(base.name) + "_wav")
 
 
-def run(inputs, output=None, flat=False, write_loops=True, overwrite=False):
-    total_files = total_written = total_skipped = 0
+def run(inputs, output=None, per_mse=False, write_loops=True, overwrite=False):
+    total_files = total_written = total_skipped = total_shared = 0
+    claimed = {}
     for inp in inputs:
         inp = inp.expanduser().resolve()
         files, base = collect(inp)
@@ -150,18 +173,21 @@ def run(inputs, output=None, flat=False, write_loops=True, overwrite=False):
         out_root = output.expanduser().resolve() if output else default_output(base)
         for f in files:
             rel = f.relative_to(base)
-            target = out_root / rel.parent if flat else out_root / rel.parent / f.stem
+            target = out_root.joinpath(*(folder_name(p) for p in rel.parent.parts))
+            if per_mse:
+                target /= f.stem
             print(f"{rel}")
             try:
-                w, s = extract(f, target, write_loops, overwrite)
+                w, s, sh = extract(f, target, claimed, write_loops, overwrite)
                 total_written += w
                 total_skipped += s
+                total_shared += sh
                 total_files += 1
             except Exception as ex:
                 print(f"  ! error on {f.name}: {ex}", file=sys.stderr)
         print(f"-> output in: {out_root}")
     print(f"\nDone: {total_written} WAVs written, {total_skipped} skipped (already existing), "
-          f"from {total_files} .mse files")
+          f"{total_shared} shared between .mse files, from {total_files} .mse files")
 
 
 # ---------------------------------------------------------------- interactive menu
@@ -193,7 +219,7 @@ def clear():
 
 def menu():
     inputs, output = [], None
-    flat, write_loops, overwrite = False, True, False
+    per_mse, write_loops, overwrite = False, True, False
     msg = ""
     while True:
         clear()
@@ -211,13 +237,13 @@ def menu():
         print("=" * 52)
         print(f"  Input:    {in_label}")
         print(f"  Output:   {out_label}")
-        print(f"  Layout:   {'flat (all WAVs in one folder)' if flat else 'one subfolder per .mse'}")
+        print(f"  Layout:   {'one subfolder per .mse' if per_mse else 'one folder per library'}")
         print(f"  Loops:    {'write root note + loop points' if write_loops else 'off'}")
         print(f"  Existing: {'overwrite' if overwrite else 'skip'}")
         print("-" * 52)
         print("  1) Set input (folder or .mse file)")
         print("  2) Set output folder")
-        print("  3) Toggle layout (subfolders / flat)")
+        print("  3) Toggle layout (per library / per .mse)")
         print("  4) Toggle loop points (on / off)")
         print("  5) Toggle existing files (skip / overwrite)")
         print("  6) Extract")
@@ -241,7 +267,7 @@ def menu():
             paths = parse_paths(ask("Output folder (leave empty for default): "))
             output = paths[0] if paths else None
         elif choice == "3":
-            flat = not flat
+            per_mse = not per_mse
         elif choice == "4":
             write_loops = not write_loops
         elif choice == "5":
@@ -253,7 +279,7 @@ def menu():
                 msg = "No .mse files in the selected input."
             else:
                 clear()
-                run(inputs, output, flat, write_loops, overwrite)
+                run(inputs, output, per_mse, write_loops, overwrite)
                 ask("\nPress Enter to return to the menu...")
         elif choice == "0":
             return
@@ -273,11 +299,12 @@ def main():
                                              "Run without arguments for the interactive menu.")
     ap.add_argument("inputs", nargs="+", type=Path, help=".mse files or folders")
     ap.add_argument("-o", "--output", type=Path, help="output folder (default: <input>_wav next to the input)")
-    ap.add_argument("--flat", action="store_true", help="no subfolder per .mse")
+    ap.add_argument("--per-mse", action="store_true",
+                    help="one subfolder per .mse (default: one folder per library, WAVs directly inside)")
     ap.add_argument("--no-loops", action="store_true", help="don't write root note and loop points (smpl chunk)")
     ap.add_argument("--overwrite", action="store_true", help="overwrite existing WAVs")
     args = ap.parse_args()
-    run(args.inputs, args.output, args.flat, not args.no_loops, args.overwrite)
+    run(args.inputs, args.output, args.per_mse, not args.no_loops, args.overwrite)
 
 
 if __name__ == "__main__":
