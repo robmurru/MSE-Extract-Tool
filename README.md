@@ -4,7 +4,7 @@ A small, dependency-free Python script that extracts the WAV samples stored insi
 
 Made by **muR Lab**.
 
-Also available with a graphical interface at [murlab.com/mse-extract](https://murlab.com/mse-extract).
+Also available with a graphical interface at [murlab.it/mse-extract](https://murlab.it/mse-extract).
 
 > **Work in progress:** development is still ongoing. The file format was reverse-engineered from sample files and not every variant has been tested yet, so expect changes. Feedback and issues are welcome.
 
